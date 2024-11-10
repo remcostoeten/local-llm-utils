@@ -13,15 +13,18 @@ Just some tools, scripts, knowledge for local development to enhance productivit
 ## Initial local setup (PopOS)
 
 - Install `Ollama` local (all round great coding AI model)
+
 `curl -fsSL https://ollama.com/install.sh | sh`
 
 - Pull the CodeLlama model (good for code related task)
+
 `ollama pull codellama`
 
 - Install python requirements
+
 `pip install requests`
 
-That's the setup done. Now we'll have to get specific. Example I will use is the `scripts/docstrings` which is an interactive CLI script to add docstrings to a file.
+### That's the setup done. Now we'll have to get specific. Example I will use is the `scripts/docstrings` which is an interactive CLI script to add docstrings to a file.
 
 - Save the original script in your projects. I'll use `src/core/scripts/docstring`. Run `cp ./scrips/docstrings//doc_utillity.py ~/path/to/your/project/src/core/scripts/docstrings`.
 - Save the LLM helper script tailored to the docstring specific in the same directory. So `cp ./scripts/docstrings/llm_docstring_wizard.py ~/path/to/project/src/core/scripts/docstrings`.
@@ -79,6 +82,7 @@ Simoply run the script with executing a parameter flag of one of these below
 --explain
 --refactor
 --commit`
+```
 
 Thus running (from the root here) `scripts/generic/enhance-workflow.py` and adding the parameter like `python3 generic/enhance-workflow.py --analyze src/components/Button.tsx`
 
@@ -97,7 +101,7 @@ Make sure to insert proper path to where the file is stored. E.g. `alias explain
 ## Performance tips
 
 # Run Ollama with GPU support
-ollama serve --gpu
+`ollama serve --gpu`
 
 # Use different models for different tasks:
 - codellama: Code analysis, generation
@@ -108,7 +112,7 @@ ollama serve --gpu
 To run an installed model, use the following command:
 ```shell
 ollama run <model-name>
-
-## List out all intallled models
+```
+### List out all intallled models
 
 `ollama list`

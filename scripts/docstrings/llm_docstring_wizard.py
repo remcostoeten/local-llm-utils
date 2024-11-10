@@ -1,129 +1,305 @@
 #!/usr/bin/env python3
 
-import subprocess
-import json
 import os
-from typing import Optional, Dict, List
+import json
 import requests
+from typing import Optional, Dict, Tuple, List
+import re
+from pathlib import Path
+import threading
+import time
+import sys
+from dataclasses import dataclass
+import functools
 
-class LLMDocStringEnhancer:
+# ANSI Colors
+CYAN = '\033[96m'
+GREEN = '\033[92m'
+YELLOW = '\033[93m'
+RED = '\033[91m'
+RESET = '\033[0m'
+
+class ProgressSpinner:
+    """Animated progress spinner for long operations."""
+    def __init__(self, message: str):
+        self.message = message
+        self.spinning = True
+        self.spinner = threading.Thread(target=self._spin)
+        self.frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self.delay = 0.1
+
+    def _spin(self):
+        i = 0
+        while self.spinning:
+            frame = self.frames[i % len(self.frames)]
+            sys.stdout.write(f"\r{CYAN}{frame} {self.message}...{RESET}")
+            sys.stdout.flush()
+            time.sleep(self.delay)
+            i += 1
+
+    def start(self):
+        self.spinner.start()
+
+    def stop(self, success: bool = True):
+        self.spinning = False
+        self.spinner.join()
+        symbol = f"{GREEN}✓" if success else f"{RED}✗"
+        sys.stdout.write(f"\r{symbol} {self.message}{RESET}\n")
+        sys.stdout.flush()
+
+class ComponentAnalyzer:
+    """Analyzes TypeScript/React components."""
+    
+    def __init__(self):
+        self.patterns = {
+            'component_name': r'(?:export\s+)?(?:function|const|class)\s+(\w+)',
+            'props_interface': r'interface\s+(\w+Props)\s*{([^}]+)}',
+            'props_type': r'type\s+(\w+Props)\s*=\s*{([^}]+)}',
+            'exports': r'export\s+(?:{([^}]+)}|default\s+(\w+))',
+            'imports': r'import\s+[^;]+from\s+[\'"]([^\'"]+)[\'"]'
+        }
+
+    @functools.lru_cache(maxsize=32)
+    def analyze(self, content: str) -> Dict[str, any]:
+        """Analyze component structure and features."""
+        info = {
+            'name': '',
+            'type': 'functional',
+            'props': [],
+            'exports': [],
+            'imports': []
+        }
+
+        # Component name and type
+        name_match = re.search(self.patterns['component_name'], content)
+        if name_match:
+            info['name'] = name_match.group(1)
+            if 'React.Component' in content or 'Component' in content:
+                info['type'] = 'class'
+
+        # Props
+        props_match = re.findall(r'(?:interface|type)\s+\w+Props\s*[={]([^}]+)}', content)
+        if props_match:
+            for props_content in props_match:
+                props = re.findall(r'(\w+)(?:\??):\s*([^;\n]+)', props_content)
+                info['props'].extend([{'name': p[0], 'type': p[1].strip()} for p in props])
+
+        # Exports
+        exports = re.findall(r'export\s+(?:const|function|class)\s+(\w+)', content)
+        info['exports'] = exports
+
+        return info
+
+class FastLLMDocGenerator:
+    """Fast documentation generator using local LLM."""
+    
     def __init__(self, base_url: str = "http://localhost:11434"):
         self.base_url = base_url
-        self.model = "codellama"  # CodeLlama is good for code-related tasks
-    
-    def _call_ollama(self, prompt: str) -> str:
-        """Make a request to the Ollama API."""
+        self.model = "codellama"
+        self.timeout = 5
+        self.cache = {}
+        self.analyzer = ComponentAnalyzer()
+
+    def _call_llm_with_timeout(self, prompt: str, file_path: str, temperature: float = 0.3) -> str:
+        """Make an LLM request with timeout and fallback."""
         try:
             response = requests.post(
                 f"{self.base_url}/api/generate",
                 json={
                     "model": self.model,
                     "prompt": prompt,
-                    "stream": False
-                }
+                    "stream": False,
+                    "temperature": temperature,
+                    "max_tokens": 200
+                },
+                timeout=self.timeout
             )
-            response.raise_for_status()
-            return response.json()["response"]
+            return response.json()["response"].strip()
         except Exception as e:
-            print(f"Error calling Ollama: {str(e)}")
-            return ""
+            component_name = os.path.basename(file_path).replace('.tsx', '').replace('.ts', '')
+            return f"A React component for {component_name} functionality."
 
-    def find_matching_file(self, query: str, project_root: str) -> Optional[str]:
-        """Use LLM to find the most relevant TypeScript file based on description."""
-        # Get list of TypeScript files
-        ts_files = []
-        for root, _, files in os.walk(project_root):
-            if "node_modules" in root or ".next" in root:
-                continue
-            for file in files:
-                if file.endswith(('.ts', '.tsx')):
-                    rel_path = os.path.relpath(os.path.join(root, file), project_root)
-                    ts_files.append(rel_path)
+    def generate_docs(self, file_path: str, detail_level: str = 'normal') -> Tuple[str, str]:
+        """Generate component documentation and example."""
+        try:
+            with open(file_path, 'r') as f:
+                content = f.read()
 
-        prompt = f"""
-Given these TypeScript files in a project:
-{json.dumps(ts_files, indent=2)}
+            info = self.analyzer.analyze(content)
+            example = self._generate_example(info)
 
-And this description of what I'm looking for:
-"{query}"
+            cache_key = f"{file_path}:{detail_level}"
+            if cache_key in self.cache:
+                description = self.cache[cache_key]
+            else:
+                prompt = self._create_description_prompt(info, detail_level)
+                description = self._call_llm_with_timeout(prompt, file_path)
+                self.cache[cache_key] = description
 
-Return only the most likely matching filename from the list above. Consider:
-1. Semantic meaning (e.g., "button component" should match "Button.tsx")
-2. File path structure (e.g., "auth form" might match "features/auth/AuthForm.tsx")
-3. Return just the path, nothing else.
-"""
-        result = self._call_ollama(prompt).strip()
-        return result if result in ts_files else None
+            return description, example
 
-    def generate_example(self, file_path: str, file_content: str) -> str:
-        """Generate a relevant example for the TypeScript component/module."""
-        prompt = f"""
-Analyze this TypeScript file content and generate a JSDoc @example block showing how to use it:
+        except Exception as e:
+            print(f"{RED}Error generating docs: {str(e)}{RESET}")
+            component_name = os.path.basename(file_path).replace('.tsx', '').replace('.ts', '')
+            return f"A React component for {component_name}.", self._generate_basic_example(component_name)
 
-{file_content}
+    def _create_description_prompt(self, info: Dict, detail_level: str) -> str:
+        """Create an optimized prompt for description generation."""
+        return f"""Write a {detail_level} description for React {info['type']} component {info['name']}.
+Props: {', '.join(p['name'] for p in info['props'])}
+Exports: {', '.join(info['exports'])}
+Keep it concise and technical."""
 
-Return only the example code that would go in the @example block. Include:
-1. Import statement if needed
-2. Basic usage example
-3. Common props/options if it's a component
-4. Keep it concise but practical
-"""
-        return self._call_ollama(prompt).strip()
+    def _generate_example(self, info: Dict) -> str:
+        """Generate a component usage example."""
+        name = info['name']
+        props = info['props']
+        exports = info['exports'] or [name]
 
-def enhance_docstring_wizard():
-    """Main function to enhance the DocString Wizard with LLM capabilities."""
+        example = [
+            f"import {{ {', '.join(exports)} }} from './{name}'",
+            "",
+            "// Basic usage",
+            f"export const Example = () => (",
+            f"  <{name}"
+        ]
+
+        # Add example props if available
+        for prop in props[:2]:
+            if 'string' in prop['type'].lower():
+                example.append(f'    {prop["name"]}="example"')
+            elif 'number' in prop['type'].lower():
+                example.append(f'    {prop["name"]}={1}')
+            elif 'boolean' in prop['type'].lower():
+                example.append(f'    {prop["name"]}={true}')
+            elif 'function' in prop['type'].lower() or '=>' in prop['type']:
+                example.append(f'    {prop["name"]}={{() => {{}}}}')
+
+        example.extend([
+            "  >",
+            "    Example content",
+            f"  </{name}>",
+            ")"
+        ])
+
+        return '\n'.join(example)
+
+    def _generate_basic_example(self, component_name: str) -> str:
+        """Generate a minimal example when analysis fails."""
+        return f"""import {{ {component_name} }} from './{component_name}'
+
+// Basic usage
+export const Example = () => (
+  <{component_name}>
+    Example content
+  </{component_name}>
+)"""
+
+class DocWriter:
+    """Handles writing documentation to files."""
+
+    @staticmethod
+    def write_docs(file_path: str, description: str, example: str) -> bool:
+        """Write documentation to the component file."""
+        try:
+            with open(file_path, 'r') as f:
+                content = f.read()
+
+            # Remove existing docstrings
+            content = re.sub(r'/\*\*[\s\S]*?\*/', '', content)
+
+            # Create new docstring
+            doc_block = [
+                "/**",
+                " * @author Remco Stoeten",
+                " *",
+                f" * @description {description}",
+                " *",
+                " */",
+                "",
+                content.lstrip(),
+                "",
+                "/**",
+                " * @example",
+                " * " + "\n * ".join(example.split('\n')),
+                " */",
+                ""
+            ]
+
+            with open(file_path, 'w') as f:
+                f.write('\n'.join(doc_block))
+
+            return True
+
+        except Exception as e:
+            print(f"{RED}Error writing docs: {str(e)}{RESET}")
+            return False
+
+def find_components(search_dir: str, pattern: str) -> List[str]:
+    """Find all matching component files."""
+    matches = []
+    for root, _, files in os.walk(search_dir):
+        for file in files:
+            if file.endswith(('.ts', '.tsx')) and pattern.lower() in file.lower():
+                matches.append(os.path.join(root, file))
+    return matches
+
+def main():
     import argparse
-    
-    parser = argparse.ArgumentParser(description="LLM-enhanced DocString Wizard")
-    parser.add_argument(
-        '--find',
-        help="Natural language description of the file you're looking for"
-    )
-    parser.add_argument(
-        '--generate-example',
-        action='store_true',
-        help="Automatically generate usage example"
-    )
-    parser.add_argument(
-        '--description',
-        help="Description to add to the docstring"
-    )
-    args, unknown = parser.parse_known_args()
 
-    enhancer = LLMDocStringEnhancer()
-    
-    # Find project root
-    project_root = os.getcwd()
-    while project_root != '/' and not os.path.exists(os.path.join(project_root, 'package.json')):
-        project_root = os.path.dirname(project_root)
-    
-    command = ['python3', 'doc_utility.py']  # Base command
-    
-    # If file finding is requested
-    if args.find:
-        matched_file = enhancer.find_matching_file(args.find, project_root)
-        if matched_file:
-            print(f"Found matching file: {matched_file}")
-            command.extend(['-i', matched_file])
-        else:
-            print("No matching file found")
+    parser = argparse.ArgumentParser(description="Fast Documentation Generator")
+    parser.add_argument('--find', help="Component pattern to search for")
+    parser.add_argument('--generate-docs', action='store_true')
+
+    args = parser.parse_args()
+
+    if args.find and args.generate_docs:
+        # Initialize generators
+        generator = FastLLMDocGenerator()
+        doc_writer = DocWriter()
+
+        # Find UI directory
+        ui_dir = os.path.join(os.path.dirname(os.getcwd()), 'ui')
+        if not os.path.exists(ui_dir):
+            ui_dir = os.getcwd()
+
+        # Find matching components
+        matches = find_components(ui_dir, args.find)
+
+        if not matches:
+            print(f"{RED}No components found{RESET}")
             return
-    
-    # Add description if provided
-    if args.description:
-        command.extend(['-d', args.description])
-    
-    # Generate and add example if requested
-    if args.generate_example and args.find:
-        with open(os.path.join(project_root, matched_file)) as f:
-            content = f.read()
-        example = enhancer.generate_example(matched_file, content)
-        if example:
-            command.append('-e')
-            print("\nGenerated example will be added to the file.")
-    
-    # Execute the original script with enhanced arguments
-    subprocess.run(command)
+
+        # Show matches
+        print(f"\n{CYAN}Found components:{RESET}")
+        for i, path in enumerate(matches, 1):
+            print(f"{i}. {os.path.relpath(path, ui_dir)}")
+
+        # Get selection
+        choice = input(f"\n{YELLOW}Select components (comma-separated numbers or 'all'):{RESET} ")
+        if not choice:
+            return
+
+        # Process selection
+        selected = range(len(matches)) if choice.lower() == 'all' else \
+                  [int(x.strip()) - 1 for x in choice.split(',')]
+
+        # Process components
+        total = len(selected)
+        for idx, file_idx in enumerate(selected, 1):
+            if 0 <= file_idx < len(matches):
+                file_path = matches[file_idx]
+                print(f"\n{CYAN}Processing ({idx}/{total}): {os.path.basename(file_path)}{RESET}")
+
+                # Show spinner while generating
+                spinner = ProgressSpinner("Generating documentation")
+                spinner.start()
+
+                # Generate and write docs
+                description, example = generator.generate_docs(file_path)
+                success = doc_writer.write_docs(file_path, description, example)
+
+                spinner.stop(success)
 
 if __name__ == "__main__":
-    enhance_docstring_wizard()
+    main()
